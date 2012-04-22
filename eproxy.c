@@ -5,6 +5,7 @@
 #define _GNU_SOURCE 1
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
@@ -194,8 +195,6 @@ openconn(int efd, struct addrinfo *host, int *cache, struct conn *other,
 /* Move from socket to pipe */
 bool move_data_in(int srcfd, struct buffer *buf)
 {
-	/* XXX what happens when the pipe fills. do we get
- 	   get another epoll event? need ioctl? */
 	for (;;) {	
 		int n = splice(srcfd, NULL, buf->pipe[1], NULL, 
 			   	BUFSZ, SPLICE_F_NONBLOCK|SPLICE_F_MOVE);
@@ -203,8 +202,12 @@ bool move_data_in(int srcfd, struct buffer *buf)
 			buf->bytes += n;
 		if (n == 0)
 			return false;
-		if (n < BUFSZ)
-			break;
+		if (n < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				return true;
+			return false;
+		}
+			
 	}
 	return true;
 }
@@ -325,28 +328,44 @@ int main(int ac, char **av)
 				continue;
 			}
 
+			struct conn *other = conn->other;
+
 			/* No attempt for partial close right now */
 			if (ev->events & EPOLLIN) {
 				bool in, out;
 				touch_conn(conn, now);
-				if (!conn->other)
+				if (!other)
 					openconn(efd, outhost, &cache_out, conn,
 						 now);
+				other = conn->other;
 				in = move_data_in(conn->fd, &conn->buf);
-				out = move_data_out(&conn->buf, 
-							 conn->other->fd);
+				out = move_data_out(&conn->buf, other->fd);
 				if (!in || !out) { 
 					closeconn(efd, conn);
 					continue;
 				}
-				touch_conn(conn->other, now);
+				touch_conn(other, now);
 			}	
 				
-			if ((ev->events & EPOLLOUT) && conn->other) {
-				if (!move_data_out(&conn->other->buf, conn->fd))
+			if ((ev->events & EPOLLOUT) && other) {
+				if (!move_data_out(&other->buf, conn->fd))
 					delconn(efd, conn);
 				else
 					touch_conn(conn, now);
+
+				/* When the pipe filled up could have
+ 				   lost input events.  Unfortunately
+ 				   splice doesn't tell us which end
+ 				   was responsible for 0, so have to ask
+				   explicitely. */
+				int len = 0;
+				if (ioctl(other->fd, FIONREAD, &len) < 0)
+					perror("ioctl");
+				if (len > 0) {
+					if (!move_data_in(other->fd, 
+							  &other->buf))
+						closeconn(efd, other);
+				}
 			}
 		}	
 
