@@ -287,23 +287,24 @@ int main(int ac, char **av)
 				continue;
 			}
 
+			/* No attempt for partial close right now */
 			if (ev->events & EPOLLIN) {
+				bool in, out;
 				if (!conn->other)
 					openconn(efd, outhost, &cache_out, conn);
-				if (move_data_in(conn->fd, &conn->buf)) {
-					if (!move_data_out(&conn->buf, 
-						      conn->other->fd)) {
-						delconn(efd, conn->other);
-						continue;
-					}
-				} else {
-					delconn(efd, conn);
+				in = move_data_in(conn->fd, &conn->buf);
+				out = move_data_out(&conn->buf, 
+							 conn->other->fd);
+				if (!in || !out) { 
+					closeconn(efd, conn);
 					continue;
 				}
 			}	
 				
-			if ((ev->events & EPOLLOUT) && conn->other)
-				move_data_out(&conn->other->buf, conn->fd);
+			if ((ev->events & EPOLLOUT) && conn->other) {
+				if (!move_data_out(&conn->other->buf, conn->fd))
+					delconn(efd, conn);
+			}
 		}	
 	}
 	return 0;
