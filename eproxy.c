@@ -337,14 +337,12 @@ int main(int ac, char **av)
 
 			/* No attempt for partial close right now */
 			if (ev->events & EPOLLIN) {
-				bool in, out;
 				touch_conn(conn, now);
 				if (!other)
-					openconn(efd, outhost, &cache_out, conn,
-						 now);
-				other = conn->other;
-				in = move_data_in(conn->fd, &conn->buf);
-				out = move_data_out(&conn->buf, other->fd);
+					other = openconn(efd, outhost, &cache_out,
+							 conn, now);
+				bool in = move_data_in(conn->fd, &conn->buf);
+				bool out = move_data_out(&conn->buf, other->fd);
 				if (!in || !out) { 
 					closeconn(efd, conn);
 					continue;
