@@ -1,5 +1,7 @@
 /* port forwarder */
 /* proxy inport outip outport */
+/* Uses pipes to splice two sockets together. We (hope) this gives something
+   approaching zero copy. */
 #define _GNU_SOURCE 1
 #include <sys/socket.h>
 #include <sys/epoll.h>
@@ -11,9 +13,11 @@
 #include <netdb.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <assert.h>
 
 #define err(x) perror(x), exit(1)
 #define NEW(x) ((x) = xmalloc(sizeof(*(x))))
+#define MAX(a,b) ((a) > (b) ? (a) : (b))
 
 void oom(void)
 {
@@ -73,9 +77,8 @@ struct buffer {
 struct conn {
 	struct conn *other;
 	int fd;
-	struct buffer *buf;
+	struct buffer buf;
 	// XXX timeout
-	// XXX ready list
 };
 
 #define MIN_EVENTS 32
@@ -86,10 +89,7 @@ int epoll_add(int efd, int fd, int revents, void *conn)
 {
 	struct epoll_event ev = { .events = revents, .data.ptr = conn };
 	if (++num_events >= max_events) {
-		if (max_events == 0)
-			max_events = MIN_EVENTS;
-		else
-			max_events *= 2;
+		max_events = MAX(max_events * 2, MIN_EVENTS);
 		events = xrealloc(events, 
 				  sizeof(struct epoll_event) * max_events);
 	}
@@ -99,20 +99,13 @@ int epoll_add(int efd, int fd, int revents, void *conn)
 int epoll_del(int efd, int fd)
 {
 	num_events--;
+	assert(num_events >= 0);
 	return epoll_ctl(efd, EPOLL_CTL_DEL, fd, (void *)1L);
 }
 
-void delconn(int efd, struct conn *conn)
+/* Create buffer between two connections */
+struct buffer *newbuffer(struct buffer *buf)
 {
-	epoll_del(efd, conn->fd);
-	close(conn->fd);
-	free(conn);
-}
-
-struct buffer *newbuffer(void)
-{
-	struct buffer *buf;
-	NEW(buf);
 	if (pipe2(buf->pipe, O_NONBLOCK) < 0) {
 		perror("pipe");
 		return NULL;
@@ -124,15 +117,25 @@ void delbuffer(struct buffer *buf)
 {
 	close(buf->pipe[0]);
 	close(buf->pipe[1]);
-	free(buf);
 }
 
-struct conn *newconn(int efd, int fd, struct buffer *buf)
+void delconn(int efd, struct conn *conn)
+{
+	delbuffer(&conn->buf);
+	epoll_del(efd, conn->fd);
+	close(conn->fd);
+	free(conn);
+}
+
+struct conn *newconn(int efd, int fd)
 {
 	struct conn *conn;
 	NEW(conn);
 	conn->fd = fd;
-	conn->buf = buf;
+	if (!newbuffer(&conn->buf)) {
+		delconn(efd, conn);
+		return NULL;
+	}
 	if (epoll_add(efd, fd, EPOLLIN|EPOLLOUT|EPOLLET, conn) < 0) {
 		perror("epoll");
 		delconn(efd, conn);
@@ -151,12 +154,7 @@ void new_request(int efd, int lfd, int *cache)
 	}
 	// xxx log
 	setnonblock(newsk, cache);
-	struct buffer *buf = newbuffer();
-	if (!buf) { 
-		close(newsk);
-		return;
-	}	
-	newconn(efd, newsk, buf);
+	newconn(efd, newsk);
 }
 
 /* Open outgoing connection */
@@ -172,10 +170,52 @@ struct conn *openconn(int efd, struct addrinfo *host, int *cache, struct conn *o
 		close(outfd);
 		return NULL;
 	}
-	return newconn(efd, outfd, other->buf);
+	struct conn *conn = newconn(efd, outfd);
+	if (conn) {
+		conn->other = other;
+		other->other = conn;
+	}
+	return conn;
 }
 
-#define BUFSZ 16384
+#define BUFSZ 16384 /* XXX */
+
+/* Move from socket to pipe */
+void move_data_in(int srcfd, struct buffer *buf)
+{
+	/* XXX what happens when the pipe fills. do we get
+ 	   get another epoll event? need ioctl? */
+	for (;;) {	
+		int n = splice(srcfd, NULL, buf->pipe[1], NULL, 
+			   	BUFSZ, SPLICE_F_NONBLOCK|SPLICE_F_MOVE);
+		if (n > 0)
+			buf->bytes += n;
+		if (n < BUFSZ)
+			break;
+	}
+}
+
+/* From pipe to socket */
+void move_data_out(struct buffer *buf, int dstfd)
+{ 
+	while (buf->bytes > 0) {
+		int bytes = buf->bytes;
+		if (bytes > BUFSZ)
+			bytes = BUFSZ;
+		int n = splice(buf->pipe[0], NULL, dstfd, NULL,
+		 	 	 bytes, SPLICE_F_NONBLOCK|SPLICE_F_MOVE);
+		if (n <= 0)
+			break;
+		buf->bytes -= n;
+	}
+}
+
+void closeconn(int efd, struct conn *conn)
+{
+	if (conn->other)
+		delconn(efd, conn->other);
+	delconn(efd, conn);		
+}
 
 int main(int ac, char **av)
 {
@@ -190,6 +230,9 @@ int main(int ac, char **av)
 	
 	int lfd = socket(laddr->ai_family, SOCK_STREAM, 0);
 	if (lfd < 0) err("socket");
+	int opt = 1;
+	if (setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(int)) < 0) 
+		err("SO_REUSEADDR");
 	if (bind(lfd, laddr->ai_addr, laddr->ai_addrlen) < 0) err("bind");
 	if (listen(lfd, 20) < 0) err("listen");
 	setnonblock(lfd, NULL);
@@ -213,8 +256,6 @@ int main(int ac, char **av)
 		for (i = 0; i < nfds; i++) { 
 			struct epoll_event *ev = &events[i];
 			struct conn *conn = ev->data.ptr;
-			struct buffer *buf;
-			int n;
 
 			/* listen socket */
 			if (conn == NULL) {
@@ -222,49 +263,22 @@ int main(int ac, char **av)
 					new_request(efd, lfd, &cache_in);
 				continue;
 			} 
-			buf = conn->buf;
-
-			/* XXX use ready list */
-			if (ev->events & EPOLLIN) {
-				if (!conn->other) {
-					conn->other = openconn(efd, outhost, &cache_out,
-							       conn);
-				} else {
-					/* XXX what happens when the pipe fills. do we get
- 					   get another epoll event? need ioctl? */
-					for (;;) {	
-						n = splice(conn->fd, NULL, buf->pipe[1], NULL, 
-						   BUFSZ, SPLICE_F_NONBLOCK|SPLICE_F_MOVE);
-						if (n > 0)
-							buf->bytes += n;
-						if (n < BUFSZ)
-							break;
-					}
-				}
-			}	
-				
-			if (ev->events & EPOLLOUT) {
-				while (buf->bytes > 0) {
-					int bytes = buf->bytes;
-					if (bytes > BUFSZ)
-						bytes = BUFSZ;
-					n = splice(buf->pipe[0], NULL, conn->fd, NULL,
-					  	 bytes, SPLICE_F_NONBLOCK|SPLICE_F_MOVE);
-					if (n <= 0)
-						break;
-					buf->bytes -= n;
-				}
-			}
 
 			if (ev->events & (EPOLLERR|EPOLLHUP)) {
-				if (conn->other)
-					delconn(efd, conn->other);
-				delbuffer(conn->buf);
-				delconn(efd, conn);				
+				closeconn(efd, conn);
+				continue;
 			}
+
+			if (ev->events & EPOLLIN) {
+				if (!conn->other)
+					openconn(efd, outhost, &cache_out, conn);
+				move_data_in(conn->fd, &conn->buf);
+			}	
+				
+			if ((ev->events & EPOLLOUT) && conn->other)
+				move_data_out(&conn->other->buf, conn->fd);
 		}	
 	}
-
 	return 0;
 }
 
