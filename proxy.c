@@ -264,6 +264,8 @@ int main(int ac, char **av)
 				continue;
 			} 
 
+			/* for testing */ fcntl(conn->fd, F_GETFL, 0);
+
 			if (ev->events & (EPOLLERR|EPOLLHUP)) {
 				closeconn(efd, conn);
 				continue;
@@ -273,6 +275,7 @@ int main(int ac, char **av)
 				if (!conn->other)
 					openconn(efd, outhost, &cache_out, conn);
 				move_data_in(conn->fd, &conn->buf);
+				move_data_out(&conn->buf, conn->other->fd);
 			}	
 				
 			if ((ev->events & EPOLLOUT) && conn->other)
