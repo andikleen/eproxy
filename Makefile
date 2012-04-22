@@ -1,6 +1,6 @@
 CFLAGS := -g -Wall
 
-proxy: proxy.o
+eproxy: eproxy.o
 
 clean:
-	rm -f proxy.o proxy
+	rm -f eproxy.o eproxy
