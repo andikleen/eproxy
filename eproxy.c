@@ -1,7 +1,12 @@
-/* port forwarder */
-/* proxy inport outip outport */
-/* Uses pipes to splice two sockets together. We (hope) this gives something
-   approaching zero copy. */
+/* 
+ * Simple port forwarder
+ * proxy inport outip outport
+ * Uses pipes to splice two sockets together. This should give something
+ * approaching zero copy, if the NIC driver is capable. 
+ * This method is rather file descriptor intensive (4 fds/conn), so make sure you 
+ * have enough. 
+ * Written 2012 by Andi Kleen
+ */
 #define _GNU_SOURCE 1
 #include <sys/socket.h>
 #include <sys/epoll.h>
