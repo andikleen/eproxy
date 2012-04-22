@@ -256,17 +256,9 @@ void touch_conn(struct conn *conn, time_t now)
 	list_move_tail(&conn->expire_node, &expire_list);
 }
 
-int main(int ac, char **av)
+int listen_socket(int efd, char *lname, char *port)
 {
-	if (ac != 4 && ac != 5) {
-		fprintf(stderr,
-			 "Usage: proxy inport outhost outport [listenaddr]\n");
-		exit(1);
-	}
-
-	struct addrinfo *outhost = resolve(av[2], av[3], 0);
-	char *lname = av[4] ? av[4] : "0.0.0.0";
-	struct addrinfo *laddr = resolve(lname, av[1], AI_PASSIVE);
+	struct addrinfo *laddr = resolve(lname, port, AI_PASSIVE);
 	
 	int lfd = socket(laddr->ai_family, SOCK_STREAM, 0);
 	if (lfd < 0) 
@@ -281,11 +273,27 @@ int main(int ac, char **av)
 	setnonblock(lfd, NULL);
 	freeaddrinfo(laddr);
 
+	if (epoll_add(efd, lfd, EPOLLIN, NULL) < 0) 
+		err("epoll add listen fd");
+
+	return lfd;
+}
+
+int main(int ac, char **av)
+{
+	if (ac != 4 && ac != 5) {
+		fprintf(stderr,
+			 "Usage: proxy inport outhost outport [listenaddr]\n");
+		exit(1);
+	}
+
+	struct addrinfo *outhost = resolve(av[2], av[3], 0);
+
 	int efd = epoll_create(10);
 	if (efd < 0) 
 		err("epoll_create");
-	if (epoll_add(efd, lfd, EPOLLIN, NULL) < 0) 
-		err("epoll add listen fd");
+
+	int lfd = listen_socket(efd, av[4] ? av[4] : "0.0.0.0", av[1]);
 
 	int cache_in = -1, cache_out = -1;	
 	int timeo = -1;
