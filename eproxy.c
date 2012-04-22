@@ -127,6 +127,7 @@ void delbuffer(struct buffer *buf)
 
 void delconn(int efd, struct conn *conn)
 {
+	list_del(&conn->expire_node);
 	delbuffer(&conn->buf);
 	epoll_del(efd, conn->fd);
 	close(conn->fd);
@@ -253,7 +254,8 @@ int expire_connections(int efd, time_t now)
 void touch_conn(struct conn *conn, time_t now)
 {
 	conn->expire = now + connection_timeout;
-	list_move_tail(&conn->expire_node, &expire_list);
+	list_del(&conn->expire_node);
+	list_add_tail(&conn->expire_node, &expire_list);
 }
 
 int listen_socket(int efd, char *lname, char *port)
