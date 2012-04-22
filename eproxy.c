@@ -14,10 +14,14 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <assert.h>
+#include <time.h>
+#include "list.h"
 
 #define err(x) perror(x), exit(1)
 #define NEW(x) ((x) = xmalloc(sizeof(*(x))))
 #define MAX(a,b) ((a) > (b) ? (a) : (b))
+
+int connection_timeout = 5; /* XXX configurable */
 
 void oom(void)
 {
@@ -45,11 +49,10 @@ struct addrinfo *resolve(char *name, char *port, int flags)
 {
 	int ret;
 	struct addrinfo *adr;
+	struct addrinfo hint = { .ai_flags = flags };
 
-	ret = getaddrinfo(name, port, 
-			  &((struct addrinfo){ .ai_flags = flags}),
-			  &adr);
-	if (ret) {
+	ret = getaddrinfo(name, port, &hint, &adr);
+		if (ret) {
 		fprintf(stderr, "proxy: Cannot resolve %s %s: %s\n",
 			name, port, gai_strerror(ret));
 		exit(1);
@@ -78,8 +81,11 @@ struct conn {
 	struct conn *other;
 	int fd;
 	struct buffer buf;
-	// XXX timeout
+	time_t expire;
+	struct list_head expire_node;
 };
+
+LIST_HEAD(expire_list);
 
 #define MIN_EVENTS 32
 struct epoll_event *events;
@@ -127,7 +133,7 @@ void delconn(int efd, struct conn *conn)
 	free(conn);
 }
 
-struct conn *newconn(int efd, int fd)
+struct conn *newconn(int efd, int fd, time_t now)
 {
 	struct conn *conn;
 	NEW(conn);
@@ -141,11 +147,13 @@ struct conn *newconn(int efd, int fd)
 		delconn(efd, conn);
 		return NULL;
 	}
+	conn->expire = now + connection_timeout;
+	list_add_tail(&conn->expire_node, &expire_list);
 	return conn;
 }
 
 /* Process incoming connection. */
-void new_request(int efd, int lfd, int *cache)
+void new_request(int efd, int lfd, int *cache, time_t now)
 {
 	int newsk = accept(lfd, NULL, NULL);
 	if (newsk < 0) {
@@ -154,12 +162,13 @@ void new_request(int efd, int lfd, int *cache)
 	}
 	// xxx log
 	setnonblock(newsk, cache);
-	newconn(efd, newsk);
+	newconn(efd, newsk, now);
 }
 
 /* Open outgoing connection */
 struct conn *
-openconn(int efd, struct addrinfo *host, int *cache, struct conn *other)
+openconn(int efd, struct addrinfo *host, int *cache, struct conn *other,
+	 time_t now)
 {
 	int outfd = socket(host->ai_family, SOCK_STREAM, 0);
 	if (outfd < 0)
@@ -171,7 +180,7 @@ openconn(int efd, struct addrinfo *host, int *cache, struct conn *other)
 		close(outfd);
 		return NULL;
 	}
-	struct conn *conn = newconn(efd, outfd);
+	struct conn *conn = newconn(efd, outfd, now);
 	if (conn) {
 		conn->other = other;
 		other->other = conn;
@@ -229,6 +238,24 @@ void closeconn(int efd, struct conn *conn)
 	delconn(efd, conn);		
 }
 
+int expire_connections(int efd, time_t now)
+{
+	struct conn *conn, *tmp;
+
+	list_for_each_entry_safe (conn, tmp, &expire_list, expire_node) {
+		if (conn->expire > now)
+			return (conn->expire - now) * 1000;
+		closeconn(efd, conn);
+	}
+	return -1;
+}
+
+void touch_conn(struct conn *conn, time_t now)
+{
+	conn->expire = now + connection_timeout;
+	list_move_tail(&conn->expire_node, &expire_list);
+}
+
 int main(int ac, char **av)
 {
 	if (ac != 4 && ac != 5) {
@@ -261,13 +288,16 @@ int main(int ac, char **av)
 		err("epoll add listen fd");
 
 	int cache_in = -1, cache_out = -1;	
+	int timeo = -1;
+
 	for (;;) {
-		// XXX timeout
-		int nfds = epoll_wait(efd, events, num_events, -1);
+		int nfds = epoll_wait(efd, events, num_events, timeo);
 		if (nfds < 0) {
 			perror("epoll");
 			continue;
 		}
+		time_t now = time(NULL);
+
 		int i;
 		for (i = 0; i < nfds; i++) { 
 			struct epoll_event *ev = &events[i];
@@ -276,11 +306,9 @@ int main(int ac, char **av)
 			/* listen socket */
 			if (conn == NULL) {
 				if (ev->events & EPOLLIN)
-					new_request(efd, lfd, &cache_in);
+					new_request(efd, lfd, &cache_in, now);
 				continue;
 			} 
-
-			/* for testing */ fcntl(conn->fd, F_GETFL, 0);
 
 			if (ev->events & (EPOLLERR|EPOLLHUP)) {
 				closeconn(efd, conn);
@@ -290,8 +318,10 @@ int main(int ac, char **av)
 			/* No attempt for partial close right now */
 			if (ev->events & EPOLLIN) {
 				bool in, out;
+				touch_conn(conn, now);
 				if (!conn->other)
-					openconn(efd, outhost, &cache_out, conn);
+					openconn(efd, outhost, &cache_out, conn,
+						 now);
 				in = move_data_in(conn->fd, &conn->buf);
 				out = move_data_out(&conn->buf, 
 							 conn->other->fd);
@@ -299,13 +329,18 @@ int main(int ac, char **av)
 					closeconn(efd, conn);
 					continue;
 				}
+				touch_conn(conn->other, now);
 			}	
 				
 			if ((ev->events & EPOLLOUT) && conn->other) {
 				if (!move_data_out(&conn->other->buf, conn->fd))
 					delconn(efd, conn);
+				else
+					touch_conn(conn, now);
 			}
 		}	
+
+		timeo = expire_connections(efd, now);
 	}
 	return 0;
 }

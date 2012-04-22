@@ -1,6 +1,6 @@
-CFLAGS := -g -Wall
+CFLAGS := -g -Wall -O2
 
-eproxy: eproxy.o
+eproxy: eproxy.o list.h
 
 clean:
 	rm -f eproxy.o eproxy
