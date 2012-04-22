@@ -158,7 +158,8 @@ void new_request(int efd, int lfd, int *cache)
 }
 
 /* Open outgoing connection */
-struct conn *openconn(int efd, struct addrinfo *host, int *cache, struct conn *other)
+struct conn *
+openconn(int efd, struct addrinfo *host, int *cache, struct conn *other)
 {
 	int outfd = socket(host->ai_family, SOCK_STREAM, 0);
 	if (outfd < 0)
@@ -181,7 +182,7 @@ struct conn *openconn(int efd, struct addrinfo *host, int *cache, struct conn *o
 #define BUFSZ 16384 /* XXX */
 
 /* Move from socket to pipe */
-void move_data_in(int srcfd, struct buffer *buf)
+bool move_data_in(int srcfd, struct buffer *buf)
 {
 	/* XXX what happens when the pipe fills. do we get
  	   get another epoll event? need ioctl? */
@@ -190,13 +191,16 @@ void move_data_in(int srcfd, struct buffer *buf)
 			   	BUFSZ, SPLICE_F_NONBLOCK|SPLICE_F_MOVE);
 		if (n > 0)
 			buf->bytes += n;
+		if (n == 0)
+			return false;
 		if (n < BUFSZ)
 			break;
 	}
+	return true;
 }
 
 /* From pipe to socket */
-void move_data_out(struct buffer *buf, int dstfd)
+bool move_data_out(struct buffer *buf, int dstfd)
 { 
 	while (buf->bytes > 0) {
 		int bytes = buf->bytes;
@@ -204,10 +208,18 @@ void move_data_out(struct buffer *buf, int dstfd)
 			bytes = BUFSZ;
 		int n = splice(buf->pipe[0], NULL, dstfd, NULL,
 		 	 	 bytes, SPLICE_F_NONBLOCK|SPLICE_F_MOVE);
-		if (n <= 0)
+		if (n == 0)
 			break;
+		if (n < 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK)
+				break;
+			return false;
+		}
 		buf->bytes -= n;
 	}
+	/* bytes > 0, add dst to epoll set */
+	/* else remove if it was added */
+	return true;
 }
 
 void closeconn(int efd, struct conn *conn)
@@ -220,7 +232,8 @@ void closeconn(int efd, struct conn *conn)
 int main(int ac, char **av)
 {
 	if (ac != 4 && ac != 5) {
-		fprintf(stderr, "Usage: proxy inport outhost outport [listenaddr]\n");
+		fprintf(stderr,
+			 "Usage: proxy inport outhost outport [listenaddr]\n");
 		exit(1);
 	}
 
@@ -229,18 +242,21 @@ int main(int ac, char **av)
 	struct addrinfo *laddr = resolve(lname, av[1], AI_PASSIVE);
 	
 	int lfd = socket(laddr->ai_family, SOCK_STREAM, 0);
-	if (lfd < 0) err("socket");
+	if (lfd < 0) 
+		err("socket");
 	int opt = 1;
 	if (setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(int)) < 0) 
 		err("SO_REUSEADDR");
-	if (bind(lfd, laddr->ai_addr, laddr->ai_addrlen) < 0) err("bind");
-	if (listen(lfd, 20) < 0) err("listen");
+	if (bind(lfd, laddr->ai_addr, laddr->ai_addrlen) < 0) 
+		err("bind");
+	if (listen(lfd, 20) < 0) 
+		err("listen");
 	setnonblock(lfd, NULL);
 	freeaddrinfo(laddr);
 
 	int efd = epoll_create(10);
-	if (efd < 0) err("epoll_create");
-
+	if (efd < 0) 
+		err("epoll_create");
 	if (epoll_add(efd, lfd, EPOLLIN, NULL) < 0) 
 		err("epoll add listen fd");
 
@@ -274,8 +290,16 @@ int main(int ac, char **av)
 			if (ev->events & EPOLLIN) {
 				if (!conn->other)
 					openconn(efd, outhost, &cache_out, conn);
-				move_data_in(conn->fd, &conn->buf);
-				move_data_out(&conn->buf, conn->other->fd);
+				if (move_data_in(conn->fd, &conn->buf)) {
+					if (!move_data_out(&conn->buf, 
+						      conn->other->fd)) {
+						delconn(efd, conn->other);
+						continue;
+					}
+				} else {
+					delconn(efd, conn);
+					continue;
+				}
 			}	
 				
 			if ((ev->events & EPOLLOUT) && conn->other)
